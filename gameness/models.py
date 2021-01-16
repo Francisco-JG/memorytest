@@ -9,6 +9,8 @@ import json
 import logging
 from decimal import Decimal
 
+from django.db.models import Count
+
 log = logging.getLogger(__name__)
 
 
@@ -20,7 +22,7 @@ class GameManager(models.Manager):
         :param player:
         :return:
         """
-        actives = self.filter(active=True, finished=False, player=player )
+        actives = self.filter(active=True, finished=False, player=player)
         if actives.count() > 1:
             log.warning(f"User {player} has more than one active round.")
         return actives.latest("created")
@@ -47,18 +49,24 @@ class GameManager(models.Manager):
         :param num:
         :return:
         """
-
-        scores = self.get_highscores()
-        # Purge all suspected games.
-        # scores = self.get_highscores().annotate(suspected_games=Count('suspects')).exclude(suspected_games__gt=0)
-        winnerlist = []
+        # Checking if a player should be disqualified.
+        suspicion = self.get_highscores().values('player').annotate(too_many=Count('suspects')).filter(too_many__gt=1)
         emails = []
+
+        for sus in suspicion:
+            emails.append(sus['player'])
+
+        # Purge all suspected games.
+        scores = self.get_highscores().annotate(suspected_games=Count('suspects')).exclude(suspected_games__gt=0)
+        winnerlist = []
+        distinct = []
 
         # Distinct is not implemented in combination with annotate. so doing a poor mans version.
         for score in scores:
-            if not score.player in emails:
-                winnerlist.append(score)
-                emails.append(score.player)
+            if score.player not in emails:
+                if score.player not in distinct:
+                    winnerlist.append(score)
+                    distinct.append(score.player)
             if len(winnerlist) == num:
                 break
         enough_winners = bool(len(winnerlist) >= num)
@@ -94,9 +102,19 @@ class Game(models.Model):
     active = models.BooleanField("Active", default=False, null=False) # Indicates if the round is active or not
     finished = models.BooleanField("Finished", default=False, null=False) # Indicates if the player finished playing the round
     playfield = models.TextField(default="{}") # Json serialized representation of the board
+    open_turn = models.BooleanField(default=False, null=False)  # Indicates if the turn has started or not
+    hold_card = models.TextField(default="{}")  # Json serialized representation of the first card of the turn
     average_time = models.DecimalField("Average time for a round", default=0, max_digits=10, decimal_places=3)
 
     objects = GameManager()
+
+    def update_turn(self, state, pick):
+        self.open_turn = state
+        self.hold_card = pick
+
+    def end_game(self, total, seconds):
+        self.score = total
+        self.average_time = seconds
 
     def total(self):
         return self.game_score()

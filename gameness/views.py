@@ -14,7 +14,7 @@ from django.utils.encoding import smart_text
 from django.views import View
 from django.views.generic.base import ContextMixin, TemplateView
 
-from gameness.models import Game
+from gameness.models import Game, SuspectedGame, Turn
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,21 @@ log = logging.getLogger(__name__)
 def aquire_csrf(request):
     from django.template.context_processors import csrf
     return csrf(request)
+
+
+def game_completed(game):
+    """
+    Method which checks if there are enough matched rounds to finish the game
+    :param game: Game object
+    :return: True/False whether the game is finished or not
+    """
+
+    matches = game.turns.filter(is_match=True).count()
+    pairs = len(json.loads(game.playfield)) * len(json.loads(game.playfield)[0]) / 2
+
+    if matches == pairs:
+        return True
+    return False
 
 
 class ContestGameView(View, ContextMixin):
@@ -53,14 +68,9 @@ class ContestGameView(View, ContextMixin):
 
         context = {"success": True}
         context.update(aquire_csrf(self.request))
+
         player = request.session["player"]
         game_id = request.session['game']
-
-        # Basic instructions
-        # Extract the click being reported
-        # Check which card is at the position the click targeted (check
-        # All full Turns (two clicks) should be serialized in the database as json
-        # Check if there is a match if second click and save it
 
         try:
             game = Game.objects.get(pk=game_id, player=player, active=True, finished=False)
@@ -71,34 +81,53 @@ class ContestGameView(View, ContextMixin):
                 f"User: {player} There is no active game associated with this session or the game in the session does not exists {game_id}.")
             return JsonResponse(context, status=404)
 
-        # Part 1: Insert code here
+        # If it's the first click of the turn, it must be saved
+        if not game.open_turn:
+            c = json.loads(request.POST["click"])
+            card = game.get_card_id(c)
+            game.update_turn(True, request.POST["click"])
+            game.save()
+            c1 = {'row': c['row'], 'column': c['column'], 'card': card}
+            return JsonResponse({"success": True, "click": [c1]}, status=200)
 
+        # comparing first and second clicks
+        click1 = json.loads(game.hold_card)
+        click2 = json.loads(request.POST["click"])
 
+        got_match = game.match([click1, click2])
+        the_click = {'click': got_match[0], 'match': got_match[1]}
 
-        # Part 2: Check if the game has been finished and ifso,
-            # Calculate a score save it to Game.score, see class methods
-            # Fill in any relevant variables in the Game class
-            # Finish the game off with cleaning up variables and call Game.set_finished()
-            # Check whether the game was considered Suspected with the SuspectedGame class
-            # if the Game is finished, return according to method documentation above
+        # saving every 2 requests in 1 line of the database
+        # bounding the turn pk to the game pk so the next session doesn't overlap
+        turn = Turn(pk=request.session.get('turn', game_id*10 + 1), game=game, meta=the_click['click'], is_match=the_click['match'])
+        turn.save()
+        request.session['turn'] = turn.pk + 1
 
-        if self.game_completed(game):
+        # closing the turn so we can start a new one
+        game.update_turn(False, "{}")
+        game.save()
+        context.update(the_click)
+
+        # closing the game
+        if game_completed(game):
             request.session.pop("game")
-            # Insert code here
+
+            score = game.calculate_score()
+            time = ((game.turns.last().created - game.created)/game.turns.count()).total_seconds()
+            game.end_game(score, time)
+            game.set_finished()
+            game.save()
+
+            # Marking suspected games
+            SuspectedGame.is_game_suspected(game)
+
+            context.update({'completed': True, 'score': game.score})
 
         # Don't forget to update the csrf token
         if "csrf_token" in context.keys():
             context.update({"csrf_token": smart_text(context["csrf_token"])})
-
         return JsonResponse(context)
 
-    def game_completed(self, game):
-        """
-        Method which checks if there are enough matched rounds to finish the game
-        :param game: Game object
-        :return: True/False whether the game is finished or not
-        """
-        return None
 
 class ContestView(TemplateView):
     """
@@ -136,7 +165,7 @@ class ContestView(TemplateView):
         context = {}
         game_name = "Memory"
         high_score_game = Game.objects.filter(player=self.request.session["player"], score__gt=0.0).order_by(
-            "score").first()
+            "score")
         game_data = {
             "success": True,
             "name": "Memory",
